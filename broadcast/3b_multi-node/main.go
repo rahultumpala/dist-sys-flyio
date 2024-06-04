@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -12,9 +11,6 @@ import (
 
 var messages []int = make([]int, 0)
 var node *maelstrom.Node
-
-var mtx sync.Mutex
-var ectx context.Context = context.Background()
 
 func handle_propagate(msg maelstrom.Message) error {
 	var body map[string]any
@@ -38,19 +34,19 @@ func propagate(input map[string]any) {
 	body["message"] = input["message"]
 	body["type"] = "propagate"
 
-	var dctx, _ = context.WithDeadline(ectx, time.Now().Add(5*time.Second))
+	var ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	for _, vertex := range node.NodeIDs() {
-		_, err := node.SyncRPC(dctx, vertex, body)
-		if err != nil {
-			panic("ERROR IN SYNC RPC")
+		if vertex != node.ID() {
+			_, err := node.SyncRPC(ctx, vertex, body)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 }
 
 func handle_broadcast(msg maelstrom.Message) error {
-	mtx.Lock()
-	defer mtx.Unlock()
-
 	var body map[string]any
 
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
