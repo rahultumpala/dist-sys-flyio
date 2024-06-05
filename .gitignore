@@ -25,3 +25,5 @@ go.work.sum
 go.sum
 maelstrom.tar.bz2
 maelstrom
+
+**/store
