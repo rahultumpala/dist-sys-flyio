@@ -19,12 +19,15 @@ func handle_propagate(msg maelstrom.Message) error {
 		return err
 	}
 
-	messages = append(messages, body["message"].(float64))
-
 	var reply = make(map[string]any)
 	reply["type"] = "propagate_ok"
 
-	return node.Reply(msg, reply)
+	err := node.Reply(msg, reply)
+	if err != nil {
+		panic(err)
+	}
+	messages = append(messages, body["message"].(float64))
+	return nil
 }
 
 func propagate(input map[string]any) {
@@ -55,7 +58,7 @@ func propagate(input map[string]any) {
 			 with incoomplete data
 			*/
 			for {
-				var ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+				var ctx, cancel = context.WithTimeout(context.Background(), 250*time.Millisecond)
 				defer cancel()
 				_, err := node.SyncRPC(ctx, vertex, body)
 				if err != nil {
@@ -77,13 +80,18 @@ func handle_broadcast(msg maelstrom.Message) error {
 
 	messages = append(messages, body["message"].(float64))
 
-	// propagate this message to all nodes in the network
-	propagate(body)
-
 	var reply = make(map[string]any)
 	reply["type"] = "broadcast_ok"
 
-	return node.Reply(msg, reply)
+	err := node.Reply(msg, reply)
+	if err != nil {
+		panic(err)
+	}
+
+	// propagate this message to all nodes in the network
+	propagate(body)
+
+	return nil
 }
 
 func handle_read(msg maelstrom.Message) error {
