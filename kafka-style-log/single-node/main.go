@@ -3,11 +3,15 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+// GLOBALS
+
 var node *maelstrom.Node
+var rw sync.RWMutex = sync.RWMutex{} // ReadWrite Mutex
 
 /*
 ----- STRUCT -----
@@ -47,7 +51,9 @@ func get_body_from_msg(msg maelstrom.Message) map[string]any {
 }
 
 func get_recent_msg(key string) (Event, bool) {
+	rw.RLock()
 	event, ok := msgs_tail[key]
+	rw.RUnlock()
 	if !ok {
 		return Event{}, false
 	}
@@ -70,6 +76,8 @@ func handle_send(msg maelstrom.Message) error {
 
 	val, ok := get_recent_msg(key)
 	curr_event := Event{offset, msg_val, nil}
+
+	rw.Lock()
 	if !ok {
 		msgs_head[key] = curr_event
 		msgs_tail[key] = curr_event
@@ -78,12 +86,16 @@ func handle_send(msg maelstrom.Message) error {
 		msgs_tail[key] = curr_event
 	}
 
+	offset++
+
 	reply := make(map[string]any)
 	reply["type"] = "send_ok"
 	reply["offset"] = offset
 
-	offset++
-	return node.Reply(msg, reply)
+	node.Reply(msg, reply)
+	rw.Unlock()
+
+	return nil
 }
 
 func handle_poll(msg maelstrom.Message) error {
@@ -93,6 +105,7 @@ func handle_poll(msg maelstrom.Message) error {
 	var results map[string][][]float64 = make(map[string][][]float64)
 
 	for key, req_offset := range offsets {
+		rw.RLock()
 		event := msgs_head[key]
 		for event.next != nil {
 			if event.offset >= req_offset.(float64) {
@@ -105,6 +118,7 @@ func handle_poll(msg maelstrom.Message) error {
 			}
 			event = *event.next
 		}
+		rw.RUnlock()
 	}
 
 	var reply map[string]any = make(map[string]any)
