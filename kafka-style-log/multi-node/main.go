@@ -10,23 +10,55 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-// GLOBALS
-
 /*
 
 Strategy:
 
 SeqKV doesn't work in real-time constraints but LinKV does.
 
-Use SeqKV to store messages for each offset of a client. - Do in background.
-Use LinKV to generate incremental offsets for each client. - Do in realtime.
+Use SeqKV to store messages for each offset of a client. - background process
+Use LinKV to store latest offsets for each client. - background process
+
+Send Handler:
+
+- Ack the send req.
+- Update in-memory cache of messages and latest offsets
+- Write to SeqKV the message with corresponding offset
+- Write to LinKV the latest offset
+- Gossip the send message to other nodes in the network
+- Gossip Latest offset to other nodes in the network
+
+Poll Handler:
+
+- Assumption is that all in-memory caches are fresh
+	( stale state here is invalidated when new gossips are read )
+- Read all messages from in-memory state and respond
+
+Commit Offset handler:
+
+- Update local committed offset state
+- Write to LinKV
+- Gossip to other nodes in network
+
+List Committed Offsets Handler:
+
+- Read from local state
+	( state state here is invalidated when new gossips are read )
 
 */
 
+// GLOBALS
+
 var node *maelstrom.Node
+
+// KV Stores
 var seqKV maelstrom.KV = *maelstrom.NewSeqKV(node)
 var linKV maelstrom.KV = *maelstrom.NewLinKV(node)
+
+// in memory cache
 var committed_offsets map[string]float64 = make(map[string]float64)
+var latest_offsets map[string]float64 = make(map[string]float64)
+var messages map[string]float64 = make(map[string]float64)
 
 /*
 -----------
@@ -44,12 +76,16 @@ func get_body_from_msg(msg maelstrom.Message) map[string]any {
 	return body
 }
 
-func get_offset(ctx context.Context, key string) float64 {
-	value, err := linKV.Read(ctx, key)
-	if err != nil && err.(*maelstrom.RPCError).Text == "KeyDoesNotExist" {
-		return 0
+func get_offset(key string) float64 {
+	value, ok := latest_offsets[key]
+	if !ok {
+		latest_offsets[key] = 1
 	}
-	return value.(float64)
+	return value + 1
+}
+
+func set_offset(key string, value float64) {
+	latest_offsets[key] = value
 }
 
 /*
@@ -63,24 +99,44 @@ func handle_send(msg maelstrom.Message) error {
 	var key string = body["key"].(string)
 	msg_val := body["msg"].(float64)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	recent_offset_key := fmt.Sprintf("recent_%s", key)
-	offset := get_offset(ctx, recent_offset_key)
-
-	linKV.CompareAndSwap(ctx, recent_offset_key, offset, offset+1, true)
-
-	go func() {
-		seqKvKey := fmt.Sprintf("%s_%f", key, offset)
-		seqKV.Write(ctx, seqKvKey, msg_val)
-	}()
+	offset := get_offset(key)
+	msg_storage_key := fmt.Sprintf("%s_%f", key, offset)
+	messages[msg_storage_key] = msg_val
 
 	reply := make(map[string]any)
 	reply["type"] = "send_ok"
 	reply["offset"] = offset
 
+	set_offset(key, offset)
 	node.Reply(msg, reply)
+
+	// Write latest Offset to LinKV
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		recent_offset_key := fmt.Sprintf("latest_%s", key)
+		linKV.CompareAndSwap(ctx, recent_offset_key, offset, offset, true)
+	}()
+
+	// Write Message to SeqKV
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		seqKvKey := fmt.Sprintf("%s_%f", key, offset)
+		seqKV.Write(ctx, seqKvKey, msg_val)
+	}()
+
+	// Gossip Send Message, latest offset to other nodes
+	go func() {
+		for _, vertex := range node.NodeIDs() {
+			if vertex == node.ID() {
+				continue
+			}
+			body["type"] = "gossip_send"
+			body["latest_offset"] = offset + 1
+			node.Send(vertex, body)
+		}
+	}()
 
 	return nil
 }
@@ -92,19 +148,13 @@ func handle_poll(msg maelstrom.Message) error {
 	var results map[string][][]float64 = make(map[string][][]float64)
 
 	for key, offset := range offsets {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-
-		recent_offset_key := fmt.Sprintf("recent_%s", key)
-		recent_offset := get_offset(ctx, recent_offset_key)
-
-		results[key] = make([][]float64, 0)
+		latest_offset := get_offset(key) - 1
 		req_offset := offset.(float64)
 
-		for ; req_offset <= recent_offset; req_offset++ {
-			seqKvKey := fmt.Sprintf("%s_%f", key, req_offset)
-			value, _ := seqKV.Read(ctx, seqKvKey)
-			results[key] = append(results[key], []float64{req_offset, value.(float64)})
+		results[key] = make([][]float64, 0)
+
+		for ; req_offset <= latest_offset; req_offset++ {
+			results[key] = append(results[key], []float64{req_offset, messages[fmt.Sprintf("%s_%f", key, req_offset)]})
 		}
 	}
 
@@ -121,16 +171,14 @@ func handle_commit_offsets(msg maelstrom.Message) error {
 
 	for key, offset := range offsets {
 		commit_offset := offset.(float64)
-		commit_offset_key := fmt.Sprintf("commit_%s", key)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		current_commit_offset := get_offset(ctx, commit_offset_key)
-
-		linKV.CompareAndSwap(ctx, commit_offset_key, current_commit_offset, commit_offset, true)
-
 		committed_offsets[key] = commit_offset
+
+		go func(key string) {
+			commit_offset_key := fmt.Sprintf("commit_%s", key)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			linKV.CompareAndSwap(ctx, commit_offset_key, latest_offsets[key], commit_offset, true)
+		}(key)
 	}
 
 	var reply map[string]string = make(map[string]string)
