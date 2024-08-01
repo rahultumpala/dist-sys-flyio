@@ -45,6 +45,16 @@ List Committed Offsets Handler:
 - Read from local state
 	( state state here is invalidated when new gossips are read )
 
+
+Note:
+-----
+
+In this strategy, KV Stores are only used as persistent storage,
+to reload in-memory cache in the event of a node crash.
+
+However, this crash is not simulated as a nemesis in this challenge,
+which means it is possible to pass this challenge without using KV at all.
+
 */
 
 // GLOBALS
@@ -110,31 +120,26 @@ func handle_send(msg maelstrom.Message) error {
 	set_offset(key, offset)
 	node.Reply(msg, reply)
 
-	// Write latest Offset to LinKV
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
+
+		// Write latest Offset to LinKV
 		recent_offset_key := fmt.Sprintf("latest_%s", key)
 		linKV.CompareAndSwap(ctx, recent_offset_key, offset, offset, true)
-	}()
 
-	// Write Message to SeqKV
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		defer cancel()
+		// Write Message to SeqKV
 		seqKvKey := fmt.Sprintf("%s_%f", key, offset)
 		seqKV.Write(ctx, seqKvKey, msg_val)
-	}()
 
-	// Gossip Send Message, latest offset to other nodes
-	go func() {
+		// Gossip Send Message, latest offset to other nodes
 		for _, vertex := range node.NodeIDs() {
 			if vertex == node.ID() {
 				continue
 			}
 			body["type"] = "gossip_send"
 			body["latest_offset"] = offset + 1
-			node.Send(vertex, body)
+			node.RPC(vertex, body, nil)
 		}
 	}()
 
@@ -151,11 +156,11 @@ func handle_poll(msg maelstrom.Message) error {
 		latest_offset := get_offset(key) - 1
 		req_offset := offset.(float64)
 
-		results[key] = make([][]float64, 0)
-
+		result := make([][]float64, 0)
 		for ; req_offset <= latest_offset; req_offset++ {
 			results[key] = append(results[key], []float64{req_offset, messages[fmt.Sprintf("%s_%f", key, req_offset)]})
 		}
+		results[key] = result
 	}
 
 	var reply map[string]any = make(map[string]any)
@@ -172,13 +177,6 @@ func handle_commit_offsets(msg maelstrom.Message) error {
 	for key, offset := range offsets {
 		commit_offset := offset.(float64)
 		committed_offsets[key] = commit_offset
-
-		go func(key string) {
-			commit_offset_key := fmt.Sprintf("commit_%s", key)
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			linKV.CompareAndSwap(ctx, commit_offset_key, latest_offsets[key], commit_offset, true)
-		}(key)
 	}
 
 	var reply map[string]string = make(map[string]string)
@@ -186,14 +184,25 @@ func handle_commit_offsets(msg maelstrom.Message) error {
 
 	node.Reply(msg, reply)
 
-	// Gossip Send Message, latest offset to other nodes
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		// Gossip Latest Offset to other nodes
 		for _, vertex := range node.NodeIDs() {
 			if vertex == node.ID() {
 				continue
 			}
 			body["type"] = "gossip_commit_offset"
-			node.Send(vertex, body)
+			node.RPC(vertex, body, nil)
+		}
+
+		// Update offsets in LinKV
+		for key, offset := range offsets {
+			commit_offset := offset.(float64)
+			committed_offsets[key] = commit_offset
+			commit_offset_key := fmt.Sprintf("commit_%s", key)
+			linKV.CompareAndSwap(ctx, commit_offset_key, latest_offsets[key], commit_offset, true)
 		}
 	}()
 
@@ -220,6 +229,7 @@ func handle_send_gossip(msg maelstrom.Message) error {
 	offset := body["latest_offset"]
 	msg_storage_key := fmt.Sprintf("%s_%f", key, offset)
 	messages[msg_storage_key] = msg_val
+
 	return nil
 }
 
@@ -240,6 +250,7 @@ func main() {
 	node = maelstrom.NewNode()
 	seqKV = *maelstrom.NewSeqKV(node)
 	linKV = *maelstrom.NewLinKV(node)
+
 	node.Handle("send", handle_send)
 	node.Handle("poll", handle_poll)
 	node.Handle("commit_offsets", handle_commit_offsets)
