@@ -52,8 +52,8 @@ List Committed Offsets Handler:
 var node *maelstrom.Node
 
 // KV Stores
-var seqKV maelstrom.KV = *maelstrom.NewSeqKV(node)
-var linKV maelstrom.KV = *maelstrom.NewLinKV(node)
+var seqKV maelstrom.KV
+var linKV maelstrom.KV
 
 // in memory cache
 var committed_offsets map[string]float64 = make(map[string]float64)
@@ -238,6 +238,8 @@ func handle_commit_offset_gossip(msg maelstrom.Message) error {
 
 func main() {
 	node = maelstrom.NewNode()
+	seqKV = *maelstrom.NewSeqKV(node)
+	linKV = *maelstrom.NewLinKV(node)
 	node.Handle("send", handle_send)
 	node.Handle("poll", handle_poll)
 	node.Handle("commit_offsets", handle_commit_offsets)
