@@ -184,7 +184,20 @@ func handle_commit_offsets(msg maelstrom.Message) error {
 	var reply map[string]string = make(map[string]string)
 	reply["type"] = "commit_offsets_ok"
 
-	return node.Reply(msg, reply)
+	node.Reply(msg, reply)
+
+	// Gossip Send Message, latest offset to other nodes
+	go func() {
+		for _, vertex := range node.NodeIDs() {
+			if vertex == node.ID() {
+				continue
+			}
+			body["type"] = "gossip_commit_offset"
+			node.Send(vertex, body)
+		}
+	}()
+
+	return nil
 }
 
 func handle_list_committed_offsets(msg maelstrom.Message) error {
@@ -194,12 +207,45 @@ func handle_list_committed_offsets(msg maelstrom.Message) error {
 	return node.Reply(msg, reply)
 }
 
+/*
+---------------------
+   Gossip Handlers
+---------------------
+*/
+
+func handle_send_gossip(msg maelstrom.Message) error {
+	body := get_body_from_msg(msg)
+	var key string = body["key"].(string)
+	msg_val := body["msg"].(float64)
+	offset := body["latest_offset"]
+	msg_storage_key := fmt.Sprintf("%s_%f", key, offset)
+	messages[msg_storage_key] = msg_val
+	return nil
+}
+
+func handle_commit_offset_gossip(msg maelstrom.Message) error {
+
+	body := get_body_from_msg(msg)
+	var offsets map[string]any = body["offsets"].(map[string]any)
+
+	for key, offset := range offsets {
+		commit_offset := offset.(float64)
+		committed_offsets[key] = commit_offset
+	}
+
+	return nil
+}
+
 func main() {
 	node = maelstrom.NewNode()
 	node.Handle("send", handle_send)
 	node.Handle("poll", handle_poll)
 	node.Handle("commit_offsets", handle_commit_offsets)
 	node.Handle("list_committed_offsets", handle_list_committed_offsets)
+
+	node.Handle("gossip_send", handle_send_gossip)
+	node.Handle("gossip_commit_offset", handle_commit_offset_gossip)
+
 	err := node.Run()
 	if err != nil {
 		log.Fatal(err)
